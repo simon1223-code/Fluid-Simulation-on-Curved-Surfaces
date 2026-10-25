@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """Two-dimensional incompressible Euler prototype with face Clebsch fields.
 
-Both ``(mu_1, lambda_1)`` and ``(mu_2, lambda_2)`` are dual 0-cochains stored
-on triangle faces.  Their dual-edge differences reconstruct a raw normal edge
-flux, which is projected to be divergence-free with impermeable boundaries.
-The centroid-distance conductance is a local two-point (TPFA) approximation;
-on a nonorthogonal barycentric dual it is not generally affine-exact.
+Both ``(mu_1, lambda_1)`` and ``(mu_2, lambda_2)`` are point-valued dual
+0-cochains stored on triangle faces.  One affine-exact least-squares gradient
+reconstructs the physical Weber field, which is mapped to integrated normal
+edge fluxes and RT0-mass Hodge-projected to enforce incompressibility and
+impermeable walls.
 
-A resettable local chart generates velocity while a never-reset material copy
-and a passive vertex dye are advected by the same SSPRK3 stages.  Optional graph
-viscosity is deliberately dissipative.  Centered face transport preserves its
-scalar mass and quadratic invariant for fixed divergence-free flux, but exact
-kinetic-energy conservation is not claimed.  Use ``--run-tests`` for diagnostics.
+The local Clebsch chart is reinitialized only by adaptive distortion criteria.
+A constrained identity-chart KKT solve preserves the projected edge flux
+exactly while matching the pre-reset Clebsch curl as closely as possible.
+The primary vorticity diagnostic is the enstrophy of the weak curl recovered
+from the actual projected velocity.
 """
 
 from __future__ import annotations
@@ -19,12 +19,11 @@ from __future__ import annotations
 import argparse
 import time
 from dataclasses import dataclass, replace
-from pathlib import Path
 
 import numpy as np
 import scipy.sparse as sp
 from scipy.sparse.csgraph import connected_components
-from scipy.sparse.linalg import lsqr, splu
+from scipy.sparse.linalg import splu
 from scipy.spatial import Delaunay
 
 
@@ -40,17 +39,17 @@ DYE_INDEX = 4
 
 @dataclass(frozen=True)
 class Settings:
-    resolution: int = 10
+    resolution: int = 80
     final_time: float = 10.0
     frames: int = 401
     cfl: float = 0.25
     maximum_time_step: float = 0.02
     rechart_cutoff: float = 1.5
-    rechart_every_frames: int = 5
+    rechart_every_frames: int = 0
     determinant_floor: float = 0.05
     initial_condition: str = PERTURBED
     perturbation_amplitude: float = 0.25
-    stabilization: str = "centered"
+    stabilization: str = "muscl"
     graph_viscosity: float = 0.0
     jitter: float = 0.12
     random_seed: int = 7
@@ -179,18 +178,31 @@ def build_operators(settings: Settings):
     interior_edge_faces = np.asarray(
         [edge_faces[edge_index] for edge_index in interior_edges], dtype=np.int64
     )
+    boundary_edge_indices = np.flatnonzero(boundary_edges)
+    boundary_edge_faces = np.asarray(
+        [edge_faces[edge_index][0] for edge_index in boundary_edge_indices],
+        dtype=np.int64,
+    )
+    boundary_edge_signs = np.asarray(
+        [d1[face_index, edge_index] for face_index, edge_index in
+         zip(boundary_edge_faces, boundary_edge_indices)],
+        dtype=float,
+    )
+    boundary_ccw_tangents = (
+        boundary_edge_signs[:, None] * tangents[boundary_edge_indices]
+    )
 
     edge01 = points[:, 1] - points[:, 0]
     edge02 = points[:, 2] - points[:, 0]
     denominator = edge01[:, 0] * edge02[:, 1] - edge01[:, 1] * edge02[:, 0]
-    gradients = np.empty((number_of_faces, 3, 2))
-    gradients[:, 0] = np.column_stack(
+    p1_basis_derivatives = np.empty((number_of_faces, 3, 2))
+    p1_basis_derivatives[:, 0] = np.column_stack(
         (points[:, 1, 1] - points[:, 2, 1], points[:, 2, 0] - points[:, 1, 0])
     ) / denominator[:, None]
-    gradients[:, 1] = np.column_stack(
+    p1_basis_derivatives[:, 1] = np.column_stack(
         (points[:, 2, 1] - points[:, 0, 1], points[:, 0, 0] - points[:, 2, 0])
     ) / denominator[:, None]
-    gradients[:, 2] = np.column_stack(
+    p1_basis_derivatives[:, 2] = np.column_stack(
         (points[:, 0, 1] - points[:, 1, 1], points[:, 1, 0] - points[:, 0, 0])
     ) / denominator[:, None]
 
@@ -205,24 +217,9 @@ def build_operators(settings: Settings):
         )
         flux_to_face_vector[face_index] = np.linalg.pinv(outward_flux_rows)
 
-    # Map dual-edge differences to primal-edge normal flux with a local TPFA
-    # conductance.  Centroid connectors are not generally edge-orthogonal, so
-    # this stable local approximation is not an affine-exact gradient.
-    conductance = np.zeros(number_of_edges)
-    for edge_index in interior_edges:
-        first_face, second_face = edge_faces[edge_index]
-        dual_length = np.linalg.norm(
-            face_centers[second_face, :2] - face_centers[first_face, :2]
-        )
-        conductance[edge_index] = edge_lengths[edge_index] / max(dual_length, 1e-15)
-    pressure_gradient = (sp.diags(conductance) @ d1.T).tocsr()
-    dual_gradient_matrix = (-pressure_gradient).tocsr()
-
-    # Local least-squares gradients are used only for face diagnostics and
-    # chart-distortion tests.  Clebsch reconstruction uses the TPFA map above.
-    # Grow a small face-neighbor stencil
-    # until it spans the plane; this also gives boundary triangles an affine-
-    # exact gradient even when they have only one immediate interior neighbor.
+    # Canonical physical gradient G_F for every face scalar. Grow each
+    # weighted least-squares stencil until it spans the plane; this keeps the
+    # reconstruction affine-exact, including on boundary triangles.
     face_neighbors = [set() for _ in range(number_of_faces)]
     for adjacent_faces in edge_faces:
         if len(adjacent_faces) == 2:
@@ -269,36 +266,125 @@ def build_operators(settings: Settings):
             gradient_rows[component].append(face_index)
             gradient_columns[component].append(face_index)
             gradient_values[component].append(-np.sum(component_coefficients))
-    face_gradient_x = sp.csr_matrix(
+    gradient_x = sp.csr_matrix(
         (gradient_values[0], (gradient_rows[0], gradient_columns[0])),
         shape=(number_of_faces, number_of_faces),
     )
-    face_gradient_y = sp.csr_matrix(
+    gradient_y = sp.csr_matrix(
         (gradient_values[1], (gradient_rows[1], gradient_columns[1])),
         shape=(number_of_faces, number_of_faces),
     )
-
-    # Identity-label reconstruction matrix used by the rechart fit.
-    coordinate_x = face_centers[:, 0]
-    coordinate_y = face_centers[:, 1]
+    face_gradient_operator = sp.vstack((gradient_x, gradient_y), format="csr")
+    coordinate_samples = face_centers[:, :2]
     coordinate_gradients = np.asarray(
-        dual_gradient_matrix @ np.column_stack((coordinate_x, coordinate_y))
-    )
-    coordinate_grad_x = coordinate_gradients[:, 0]
-    coordinate_grad_y = coordinate_gradients[:, 1]
-    identity_chart_flux_matrix = sp.hstack(
-        (
-            sp.diags(coordinate_grad_x) @ face_edge_average,
-            sp.diags(coordinate_grad_y) @ face_edge_average,
-        ),
-        format="csr",
+        face_gradient_operator @ coordinate_samples
+    ).reshape(2, number_of_faces, 2).transpose(1, 2, 0)
+    affine_gradient_error = float(
+        np.max(np.abs(coordinate_gradients - np.eye(2)[None, :, :]))
     )
 
-    # Pin one pressure per connected face component and factor the scalar
-    # Neumann problem once.  Projection and label reconstruction intentionally
-    # use the same conductance/Hodge map.
-    neumann_laplacian = (d1 @ pressure_gradient).tocsc()
-    adjacency = neumann_laplacian.copy()
+    # Affine-exact reconstruction R_{F->E}.  A plain arithmetic average of
+    # neighboring face-centroid values is not consistent on a general
+    # triangular mesh: for an affine scalar it need not equal the value at the
+    # edge midpoint.  Reconstruct each incident face linearly to the midpoint
+    # with G_F, then average the one-sided values.  Thus R reproduces every
+    # affine scalar exactly at every edge midpoint.
+    edge_midpoints = 0.5 * (
+        vertices[edges[:, 0], :2] + vertices[edges[:, 1], :2]
+    )
+    face_edge_midpoint_offsets = (
+        edge_midpoints[face_edge_indices] - face_centers[:, None, :2]
+    )
+    occurrence_faces = np.repeat(np.arange(number_of_faces), 3)
+    occurrence_edges = face_edge_indices.ravel()
+    occurrence_offsets = face_edge_midpoint_offsets.reshape(-1, 2)
+    inverse_incidence_count = 1.0 / incident_face_count[occurrence_edges]
+    edge_offset_x = sp.csr_matrix(
+        (
+            occurrence_offsets[:, 0] * inverse_incidence_count,
+            (occurrence_edges, occurrence_faces),
+        ),
+        shape=(number_of_edges, number_of_faces),
+    )
+    edge_offset_y = sp.csr_matrix(
+        (
+            occurrence_offsets[:, 1] * inverse_incidence_count,
+            (occurrence_edges, occurrence_faces),
+        ),
+        shape=(number_of_edges, number_of_faces),
+    )
+    face_to_edge_reconstruction = (
+        face_edge_average + edge_offset_x @ gradient_x + edge_offset_y @ gradient_y
+    ).tocsr()
+    reconstructed_coordinates = np.asarray(
+        face_to_edge_reconstruction @ coordinate_samples
+    )
+    affine_edge_reconstruction_error = float(
+        np.max(np.abs(reconstructed_coordinates - edge_midpoints))
+    )
+
+    # N maps face-vector samples to globally oriented integrated normal edge
+    # fluxes.  The vector components are first reconstructed to the edge
+    # midpoint by the same affine-exact scalar operator R_{F->E}.
+    normal_x = (
+        sp.diags(edge_lengths * right_normals[:, 0])
+        @ face_to_edge_reconstruction
+    )
+    normal_y = (
+        sp.diags(edge_lengths * right_normals[:, 1])
+        @ face_to_edge_reconstruction
+    )
+    face_vector_to_edge_flux = sp.hstack((normal_x, normal_y), format="csr")
+
+    # With identity labels, affine exactness gives w_F=(mu_1,mu_2), so the
+    # rechart recovery matrix is exactly the same face-vector-to-flux map N.
+    identity_chart_flux_matrix = face_vector_to_edge_flux
+
+    # With identity labels lambda_1=x and lambda_2=y, the Clebsch field is
+    # w=(mu_1,mu_2), so its scalar curl is d_x mu_2 - d_y mu_1.  This
+    # linear operator is used only by the optional vorticity-aware rechart fit.
+    identity_chart_vorticity_matrix = sp.hstack(
+        (-gradient_y, gradient_x), format="csr"
+    )
+
+    # Assemble the RT0 mass matrix for globally oriented integrated edge
+    # fluxes. This supplies the physical metric for the constrained Hodge
+    # projection and keeps that projection distinct from G_F.
+    mass_rows = []
+    mass_columns = []
+    mass_values = []
+    opposite_vertices = np.array((2, 0, 1))
+    barycentric_quadrature = np.array(
+        ((2.0 / 3.0, 1.0 / 6.0, 1.0 / 6.0),
+         (1.0 / 6.0, 2.0 / 3.0, 1.0 / 6.0),
+         (1.0 / 6.0, 1.0 / 6.0, 2.0 / 3.0))
+    )
+    for face_index in range(number_of_faces):
+        quadrature_points = barycentric_quadrature @ points[face_index]
+        basis_values = (
+            quadrature_points[:, None, :]
+            - points[face_index, opposite_vertices][None, :, :]
+        ) / (2.0 * face_areas[face_index])
+        local_mass = (
+            face_areas[face_index]
+            / 3.0
+            * np.einsum("qic,qjc->ij", basis_values, basis_values)
+        )
+        signs = face_edge_signs[face_index]
+        local_mass *= signs[:, None] * signs[None, :]
+        local_ids = face_edge_indices[face_index]
+        mass_rows.extend(np.repeat(local_ids, 3))
+        mass_columns.extend(np.tile(local_ids, 3))
+        mass_values.extend(local_mass.ravel())
+    edge_flux_mass = sp.coo_matrix(
+        (mass_values, (mass_rows, mass_columns)),
+        shape=(number_of_edges, number_of_edges),
+    ).tocsr()
+
+    # Eliminate boundary fluxes, remove one dependent divergence equation per
+    # connected face component, and factor the mixed RT0-P0 Hodge system once.
+    incidence = abs(d1[:, interior_edges])
+    adjacency = (incidence @ incidence.T).tocsr()
     adjacency.setdiag(0.0)
     adjacency.eliminate_zeros()
     number_of_components, labels = connected_components(adjacency, directed=False)
@@ -306,9 +392,43 @@ def build_operators(settings: Settings):
         [np.flatnonzero(labels == label)[0] for label in range(number_of_components)]
     )
     free_faces = np.setdiff1d(np.arange(number_of_faces), pinned_faces)
-    poisson_factorization = splu(
-        neumann_laplacian[free_faces][:, free_faces].tocsc()
+    divergence_constraints = d1[free_faces][:, interior_edges].tocsr()
+    interior_flux_mass = edge_flux_mass[interior_edges][:, interior_edges].tocsc()
+    zero_pressure_block = sp.csc_matrix((len(free_faces), len(free_faces)))
+    hodge_system = sp.bmat(
+        (
+            (interior_flux_mass, divergence_constraints.T),
+            (divergence_constraints, zero_pressure_block),
+        ),
+        format="csc",
     )
+    hodge_factorization = splu(hodge_system)
+    # Constrained rechart system. The new identity-chart coefficients c are
+    # chosen to match the current edge flux exactly while minimizing a weighted
+    # curl mismatch plus a tiny minimum-change regularizer.
+    rechart_curl = identity_chart_vorticity_matrix.tocsr()
+    rechart_flux = identity_chart_flux_matrix.tocsr()
+    rechart_face_mass = sp.diags(face_areas)
+    rechart_curl_normal = (
+        rechart_curl.T @ rechart_face_mass @ rechart_curl
+    ).tocsc()
+    positive_diagonal = np.asarray(rechart_curl_normal.diagonal())
+    positive_diagonal = positive_diagonal[positive_diagonal > 0.0]
+    rechart_scale = float(np.mean(positive_diagonal)) if len(positive_diagonal) else 1.0
+    rechart_beta = 1e-4 * max(rechart_scale, 1e-15)
+    rechart_hessian = rechart_curl_normal + rechart_beta * sp.eye(
+        2 * number_of_faces, format="csc"
+    )
+    rechart_system = sp.bmat(
+        (
+            (rechart_hessian, rechart_flux.T),
+            (rechart_flux, sp.csc_matrix((number_of_edges, number_of_edges))),
+        ),
+        format="csc",
+    )
+    rechart_factorization = splu(rechart_system)
+    rechart_curl_rhs = (rechart_curl.T @ rechart_face_mass).tocsr()
+
     exactness = (d1 @ d0).tocsr()
     exactness_error = 0.0 if exactness.nnz == 0 else float(np.max(np.abs(exactness.data)))
 
@@ -327,7 +447,7 @@ def build_operators(settings: Settings):
         "flux_to_face_vector": flux_to_face_vector,
         "edge_lengths": edge_lengths,
         "right_normals": right_normals,
-        "gradients": gradients,
+        "p1_basis_derivatives": p1_basis_derivatives,
         "d0": d0,
         "d1": d1,
         "star0": star0,
@@ -336,28 +456,67 @@ def build_operators(settings: Settings):
         # convention, while lambda and mu here are values at dual vertices.
         "dual_star0": face_areas,
         "boundary_edges": boundary_edges,
+        "boundary_edge_indices": boundary_edge_indices,
+        "boundary_edge_faces": boundary_edge_faces,
+        "boundary_ccw_tangents": boundary_ccw_tangents,
         "interior_edges": interior_edges,
         "interior_edge_faces": interior_edge_faces,
         "face_edge_average": face_edge_average,
-        "conductance": conductance,
-        "dual_gradient_matrix": dual_gradient_matrix,
-        "pressure_gradient": pressure_gradient,
-        "face_gradient_x": face_gradient_x,
-        "face_gradient_y": face_gradient_y,
+        "face_edge_midpoint_offsets": face_edge_midpoint_offsets,
+        "face_to_edge_reconstruction": face_to_edge_reconstruction,
+        "face_gradient": face_gradient_operator,
+        "face_vector_to_edge_flux": face_vector_to_edge_flux,
+        "edge_flux_mass": edge_flux_mass,
         "identity_chart_flux_matrix": identity_chart_flux_matrix,
-        "poisson_factorization": poisson_factorization,
-        "free_faces": free_faces,
+        "identity_chart_vorticity_matrix": identity_chart_vorticity_matrix,
+        "rechart_beta": rechart_beta,
+        "rechart_curl_rhs": rechart_curl_rhs,
+        "rechart_factorization": rechart_factorization,
+        "hodge_factorization": hodge_factorization,
+        "projection_free_faces": free_faces,
         "number_of_projection_components": number_of_components,
+        "affine_gradient_error": affine_gradient_error,
+        "affine_edge_reconstruction_error": affine_edge_reconstruction_error,
         "exactness_error": exactness_error,
     }
 
 
 def edge_flux_to_face_vectors(edge_flux, operators):
+    """Recover the constant face velocity represented by projected fluxes."""
     outward_flux = (
         operators["face_edge_signs"]
         * np.asarray(edge_flux)[operators["face_edge_indices"]]
     )
     return np.einsum("fij,fj->fi", operators["flux_to_face_vector"], outward_flux)
+
+
+def face_vectors_to_edge_flux(face_vectors, operators):
+    """Apply N: centered face vectors to integrated global-normal edge flux."""
+    face_vectors = np.asarray(face_vectors)
+    expected_shape = (len(operators["faces"]), 2)
+    if face_vectors.shape != expected_shape:
+        raise ValueError(
+            f"face vectors must have shape {expected_shape}, got {face_vectors.shape}"
+        )
+    coefficients = np.concatenate((face_vectors[:, 0], face_vectors[:, 1]))
+    return np.asarray(
+        operators["face_vector_to_edge_flux"] @ coefficients
+    ).ravel()
+
+
+def face_gradient(face_fields, operators):
+    """Apply the affine-exact face gradient G_F to one or more scalars."""
+    face_fields = np.asarray(face_fields)
+    scalar_input = face_fields.ndim == 1
+    if scalar_input:
+        face_fields = face_fields[:, None]
+    if face_fields.ndim != 2 or face_fields.shape[0] != len(operators["faces"]):
+        raise ValueError("face fields must have one row per face")
+    number_of_faces, number_of_fields = face_fields.shape
+    derivatives = np.asarray(operators["face_gradient"] @ face_fields)
+    gradients = derivatives.reshape(2, number_of_faces, number_of_fields)
+    gradients = gradients.transpose(1, 2, 0)
+    return gradients[:, 0] if scalar_input else gradients
 
 
 def face_fields_to_vertex_fields(face_fields, operators):
@@ -383,28 +542,8 @@ def face_vectors_to_vertex_vectors(face_vectors, operators):
     return face_fields_to_vertex_fields(face_vectors, operators)
 
 
-def dual_gradient(face_fields, operators):
-    """Map face dual-0 values to local normal-flux gradient approximations."""
-    face_fields = np.asarray(face_fields)
-    scalar_input = face_fields.ndim == 1
-    if scalar_input:
-        face_fields = face_fields[:, None]
-    if face_fields.shape[0] != len(operators["faces"]):
-        raise ValueError("dual-gradient fields must have one row per face")
-    gradient = np.asarray(operators["dual_gradient_matrix"] @ face_fields)
-    return gradient[:, 0] if scalar_input else gradient
-
-
-def reconstruct_and_project(chart_fields, operators):
-    """Return ``(p, u_e)`` for ``u_e = P sum_a(mu_a grad(lambda_a))``.
-
-    ``p`` is the auxiliary face projection potential and ``u_e`` is an array
-    of integrated normal edge fluxes.  ``chart_fields`` stores one dual
-    0-cochain per column, hence it must have one row per primal face.  The
-    label gradient is the local barycentric dual derivative
-    ``-B C d1.T lambda`` and mu is centered from the two incident faces to the
-    corresponding primal edge.
-    """
+def clebsch_face_velocity(chart_fields, operators):
+    """Return w_F = sum_a mu_a G_F(lambda_a) on each face."""
     chart_fields = np.asarray(chart_fields)
     expected_shape = (len(operators["faces"]), CLEBSCH_FIELD_COUNT)
     if chart_fields.shape != expected_shape:
@@ -412,54 +551,81 @@ def reconstruct_and_project(chart_fields, operators):
             f"chart_fields must contain face-based Clebsch data with shape "
             f"{expected_shape}, got {chart_fields.shape}"
         )
-    edge_mu_mean = np.asarray(
-        operators["face_edge_average"] @ chart_fields[:, MU1 : MU2 + 1]
-    )
-    lambda_normal_integrals = dual_gradient(
+    lambda_gradients = face_gradient(
         chart_fields[:, LAMBDA1 : LAMBDA2 + 1], operators
     )
-    raw_edge_flux = np.sum(edge_mu_mean * lambda_normal_integrals, axis=1)
+    raw_face_velocity = np.sum(
+        chart_fields[:, MU1 : MU2 + 1, None] * lambda_gradients,
+        axis=1,
+    )
+    return raw_face_velocity
+
+
+def reconstruct_and_project(chart_fields, operators):
+    """Reconstruct face Clebsch velocity, map it to flux, and project it."""
+    raw_face_velocity = clebsch_face_velocity(chart_fields, operators)
+    raw_edge_flux = face_vectors_to_edge_flux(raw_face_velocity, operators)
     return project_edge_flux(raw_edge_flux, operators)
 
 
 def project_edge_flux(raw_edge_flux, operators):
-    """Project ``u_raw`` to ``d1 u_e=0`` with zero boundary flux."""
+    """RT0-mass Hodge projection onto divergence-free, wall-tangent fluxes."""
     raw_edge_flux = np.asarray(raw_edge_flux).ravel()
     if raw_edge_flux.shape != (len(operators["edges"]),):
         raise ValueError("raw_edge_flux must have one value per edge")
-    masked_edge_flux = raw_edge_flux.copy()
-    masked_edge_flux[operators["boundary_edges"]] = 0.0
-    free_faces = operators["free_faces"]
-    divergence = np.asarray(operators["d1"] @ masked_edge_flux).ravel()
-    projection_potential = np.zeros(len(operators["faces"]))
-    projection_potential[free_faces] = operators["poisson_factorization"].solve(
-        divergence[free_faces]
+    interior_edges = operators["interior_edges"]
+    free_faces = operators["projection_free_faces"]
+    weighted_raw_flux = np.asarray(
+        operators["edge_flux_mass"] @ raw_edge_flux
+    ).ravel()[interior_edges]
+    right_hand_side = np.concatenate(
+        (weighted_raw_flux, np.zeros(len(free_faces)))
     )
-    correction_flux = np.asarray(
-        operators["pressure_gradient"] @ projection_potential
-    ).ravel()
-    projected_edge_flux = masked_edge_flux - correction_flux
-    projected_edge_flux[operators["boundary_edges"]] = 0.0
-    return projection_potential, projected_edge_flux
+    solution = operators["hodge_factorization"].solve(right_hand_side)
+    projected_edge_flux = np.zeros(len(operators["edges"]))
+    projected_edge_flux[interior_edges] = solution[: len(interior_edges)]
+    projection_multiplier = np.zeros(len(operators["faces"]))
+    projection_multiplier[free_faces] = solution[len(interior_edges) :]
+    return projection_multiplier, projected_edge_flux
 
 
 def centered_advection_matrix(edge_flux, operators):
-    """Return the face/dual-vertex centered transport generator.
-
-    For a face scalar f, the finite-volume weak rate is
-
-        dual_star0 f_dot = -d1 diag(u_e) A_f->e f,
-
-    where ``A_f->e`` averages the values of the incident faces.  With a
-    divergence-free impermeable flux, this operator preserves constants,
-    face-area-weighted mass, and the face-area-weighted quadratic invariant.
-    """
+    """Return the affine-exact centered transport generator for face scalars."""
     weak_operator = (
         -operators["d1"]
         @ sp.diags(np.asarray(edge_flux))
-        @ operators["face_edge_average"]
+        @ operators["face_to_edge_reconstruction"]
     ).tocsr()
     return (sp.diags(1.0 / operators["dual_star0"]) @ weak_operator).tocsr()
+
+
+def initial_stream_function(x, y, settings: Settings):
+    """Streamfunction whose rotated gradient gives the built-in initial velocity."""
+    if settings.initial_condition == TAYLOR_GREEN:
+        epsilon = 0.0
+    elif settings.initial_condition == PERTURBED:
+        epsilon = settings.perturbation_amplitude
+    else:
+        raise ValueError(
+            f"unknown initial condition {settings.initial_condition!r}; "
+            f"expected one of {INITIAL_CONDITIONS}"
+        )
+    return np.sin(x) * np.sin(y) + epsilon * np.sin(2.0 * x) * np.sin(3.0 * y)
+
+
+def exact_initial_edge_flux(operators, settings: Settings):
+    """Exact integrated normal flux of the built-in streamfunction velocity.
+
+    With globally oriented tangent t and right normal n=(t_y,-t_x),
+    u=(psi_y,-psi_x) satisfies int_e u.n ds = psi(v_1)-psi(v_0).
+    Thus d0 applied to vertex streamfunction samples gives a divergence-free
+    wall-tangent initial edge flux up to roundoff.
+    """
+    xy = operators["vertices"][:, :2]
+    psi = initial_stream_function(xy[:, 0], xy[:, 1], settings)
+    flux = np.asarray(operators["d0"] @ psi).ravel()
+    flux[operators["boundary_edges"]] = 0.0
+    return flux
 
 
 def initial_velocity(x, y, settings: Settings):
@@ -475,6 +641,23 @@ def initial_velocity(x, y, settings: Settings):
     ux = np.sin(x) * np.cos(y) + 3.0 * epsilon * np.sin(2.0 * x) * np.cos(3.0 * y)
     uy = -np.cos(x) * np.sin(y) - 2.0 * epsilon * np.cos(2.0 * x) * np.sin(3.0 * y)
     return np.column_stack((ux, uy))
+
+
+def initial_vorticity(x, y, settings: Settings):
+    """Analytic initial scalar vorticity curl(u_0) for the built-in tests."""
+    if settings.initial_condition == TAYLOR_GREEN:
+        epsilon = 0.0
+    elif settings.initial_condition == PERTURBED:
+        epsilon = settings.perturbation_amplitude
+    else:
+        raise ValueError(
+            f"unknown initial condition {settings.initial_condition!r}; "
+            f"expected one of {INITIAL_CONDITIONS}"
+        )
+    return (
+        2.0 * np.sin(x) * np.sin(y)
+        + 13.0 * epsilon * np.sin(2.0 * x) * np.sin(3.0 * y)
+    )
 
 
 def initial_condition_label(settings: Settings):
@@ -508,8 +691,77 @@ def initialize_fields(operators, settings: Settings):
     return face_clebsch_fields, dye
 
 
-def advection_rhs(transported_fields, edge_flux, operators, settings: Settings):
-    """Advect face-based Clebsch dual 0-cochains by finite-volume fluxes."""
+def muscl_upwind_edge_values(transported_fields, edge_flux, operators):
+    """Slope-limited second-order upwind values at primal-edge midpoints.
+
+    Face values are treated as centroid samples.  The same affine-exact G_F
+    used by Clebsch reconstruction provides slopes.  A Barth--Jespersen-style
+    scalar limiter keeps every reconstructed edge value inside the range of
+    the current face and its edge-neighbors, suppressing the grid-scale
+    oscillations produced by the formerly centered nonlinear transport.
+    """
+    transported_fields = np.asarray(transported_fields)
+    number_of_faces, number_of_fields = transported_fields.shape
+    gradients = face_gradient(transported_fields, operators)
+    local_increments = np.einsum(
+        "fsi,fei->fes", gradients, operators["face_edge_midpoint_offsets"]
+    )
+
+    local_minimum = transported_fields.copy()
+    local_maximum = transported_fields.copy()
+    edge_faces = operators["interior_edge_faces"]
+    first_faces = edge_faces[:, 0]
+    second_faces = edge_faces[:, 1]
+    np.minimum.at(local_minimum, first_faces, transported_fields[second_faces])
+    np.minimum.at(local_minimum, second_faces, transported_fields[first_faces])
+    np.maximum.at(local_maximum, first_faces, transported_fields[second_faces])
+    np.maximum.at(local_maximum, second_faces, transported_fields[first_faces])
+
+    limiter = np.ones((number_of_faces, number_of_fields))
+    tolerance = 1e-14
+    for local_edge in range(3):
+        increment = local_increments[:, local_edge, :]
+        ratio = np.ones_like(increment)
+        positive = increment > tolerance
+        negative = increment < -tolerance
+        ratio[positive] = (
+            (local_maximum - transported_fields)[positive] / increment[positive]
+        )
+        ratio[negative] = (
+            (local_minimum - transported_fields)[negative] / increment[negative]
+        )
+        limiter = np.minimum(limiter, np.clip(ratio, 0.0, 1.0))
+
+    local_edge_values = (
+        transported_fields[:, None, :]
+        + limiter[:, None, :] * local_increments
+    )
+    local_edge_indices = operators["face_edge_indices"]
+    local_edge_signs = operators["face_edge_signs"]
+    local_outward_flux = np.asarray(edge_flux)[local_edge_indices] * local_edge_signs
+
+    edge_values = np.zeros((len(operators["edges"]), number_of_fields))
+    selected_count = np.zeros(len(operators["edges"]))
+    upwind = local_outward_flux > 0.0
+    np.add.at(edge_values, local_edge_indices[upwind], local_edge_values[upwind])
+    np.add.at(selected_count, local_edge_indices[upwind], 1.0)
+
+    # Projected wall fluxes and exact stagnation edges carry no advective flux,
+    # so their scalar value is immaterial.  Fill them with the affine-exact
+    # centered value to keep the returned array finite and useful diagnostically.
+    unselected = selected_count == 0.0
+    if np.any(unselected):
+        centered_values = (
+            operators["face_to_edge_reconstruction"] @ transported_fields
+        )
+        edge_values[unselected] = centered_values[unselected]
+    return edge_values
+
+
+def face_advection_rhs(
+    transported_fields, edge_flux, operators, *, stabilization, graph_viscosity
+):
+    """Conservative finite-volume advection for one or more face scalars."""
     transported_fields = np.asarray(transported_fields)
     if transported_fields.ndim == 1:
         transported_fields = transported_fields[:, None]
@@ -519,14 +771,39 @@ def advection_rhs(transported_fields, edge_flux, operators, settings: Settings):
     if transported_fields.shape[0] != len(operators["faces"]):
         raise ValueError("face-transported fields must have one row per face")
 
-    edge_values = operators["face_edge_average"] @ transported_fields
-    weak_rhs = np.asarray(
-        -operators["d1"] @ (np.asarray(edge_flux)[:, None] * edge_values)
-    )
-    if settings.stabilization == "graph" and settings.graph_viscosity > 0.0:
+    flux = np.asarray(edge_flux).ravel()
+    if stabilization == "muscl":
+        edge_values = muscl_upwind_edge_values(
+            transported_fields, flux, operators
+        )
+        weak_rhs = np.asarray(
+            -operators["d1"] @ (flux[:, None] * edge_values)
+        )
+    elif stabilization == "skew":
+        # Affine-consistent skew-adjoint split form.  Let
+        #   B = -D diag(F) R,
+        # where R reconstructs face values to edge midpoints.  For a projected
+        # flux D F = 0 with F=0 on the boundary, the continuum transport
+        # operator is skew-adjoint.  We enforce the same algebraic property by
+        # using K=(B-B^T)/2.  Hence q^T K q=0 and, because K 1=0, both
+        # face-mass and the semidiscrete quadratic invariant are preserved.
+        reconstruction = operators["face_to_edge_reconstruction"]
+        incidence = operators["d1"]
+        edge_values = reconstruction @ transported_fields
+        forward = np.asarray(-incidence @ (flux[:, None] * edge_values))
+        adjoint = np.asarray(
+            -reconstruction.T @ (flux[:, None] * (incidence.T @ transported_fields))
+        )
+        weak_rhs = 0.5 * (forward - adjoint)
+    else:
+        edge_values = operators["face_to_edge_reconstruction"] @ transported_fields
+        weak_rhs = np.asarray(
+            -operators["d1"] @ (flux[:, None] * edge_values)
+        )
+    if stabilization == "graph" and graph_viscosity > 0.0:
         edge_faces = operators["interior_edge_faces"]
         diffusion_strength = (
-            settings.graph_viscosity
+            graph_viscosity
             * np.abs(np.asarray(edge_flux)[operators["interior_edges"]])
         )
         difference = (
@@ -538,6 +815,15 @@ def advection_rhs(transported_fields, edge_flux, operators, settings: Settings):
         np.add.at(weak_rhs, edge_faces[:, 1], -contribution)
     result = weak_rhs / operators["dual_star0"][:, None]
     return result[:, 0] if squeeze else result
+
+
+def advection_rhs(transported_fields, edge_flux, operators, settings: Settings):
+    """Advect the face Clebsch state with the selected solver stabilization."""
+    return face_advection_rhs(
+        transported_fields, edge_flux, operators,
+        stabilization=settings.stabilization,
+        graph_viscosity=settings.graph_viscosity,
+    )
 
 
 def vertex_advection_rhs(transported_fields, edge_flux, operators, settings: Settings):
@@ -552,7 +838,7 @@ def vertex_advection_rhs(transported_fields, edge_flux, operators, settings: Set
         raise ValueError("vertex-transported fields must have one row per vertex")
     face_velocity = edge_flux_to_face_vectors(edge_flux, operators)
     velocity_dot_grad_basis = np.einsum(
-        "fij,fj->fi", operators["gradients"], face_velocity
+        "fij,fj->fi", operators["p1_basis_derivatives"], face_velocity
     )
     face_field_mean = np.mean(transported_fields[operators["faces"]], axis=1)
     face_weak_rhs = (
@@ -588,7 +874,7 @@ def vertex_advection_rhs(transported_fields, edge_flux, operators, settings: Set
 
 
 def stage_rhs(face_state, dye, operators, settings: Settings):
-    """Advect ``[local chart | material copy]`` with the chart's velocity."""
+    """Advect chart/material fields and passive dye with the chart velocity."""
     chart = face_state[:, :CLEBSCH_FIELD_COUNT]
     _, edge_flux = reconstruct_and_project(chart, operators)
     return (
@@ -600,7 +886,7 @@ def stage_rhs(face_state, dye, operators, settings: Settings):
 def ssprk3_step(
     chart_fields, material_fields, dye, time_step, operators, settings: Settings
 ):
-    """Advance face ``(C, M)`` and vertex dye with feedback from chart ``C``."""
+    """Advance Clebsch state and passive dye with SSPRK3 stage velocities."""
     face_state = np.hstack((chart_fields, material_fields))
     face_rate, dye_rate = stage_rhs(face_state, dye, operators, settings)
     face_stage1 = face_state + time_step * face_rate
@@ -620,31 +906,11 @@ def ssprk3_step(
     next_dye = (1.0 / 3.0) * dye + (2.0 / 3.0) * (
         dye_stage2 + time_step * dye_rate
     )
-    projection_potential, edge_flux = reconstruct_and_project(next_chart, operators)
-    return next_chart, next_material, next_dye, projection_potential, edge_flux
-
-
-def face_field_gradients(fields, operators):
-    """Recover affine-exact planar gradients from face-centered samples."""
-    fields = np.asarray(fields)
-    if fields.ndim == 1:
-        return np.column_stack(
-            (
-                operators["face_gradient_x"] @ fields,
-                operators["face_gradient_y"] @ fields,
-            )
-        )
-    return np.stack(
-        (
-            operators["face_gradient_x"] @ fields,
-            operators["face_gradient_y"] @ fields,
-        ),
-        axis=2,
-    )
-
+    projection_multiplier, edge_flux = reconstruct_and_project(next_chart, operators)
+    return next_chart, next_material, next_dye, projection_multiplier, edge_flux
 
 def chart_metrics(chart_fields, operators):
-    gradients = face_field_gradients(chart_fields, operators)
+    gradients = face_gradient(chart_fields, operators)
     jacobian = np.stack((gradients[:, LAMBDA1], gradients[:, LAMBDA2]), axis=1)
     singular_values = np.linalg.svd(jacobian, compute_uv=False)
     sigma_max = singular_values[:, 0]
@@ -671,7 +937,7 @@ def interpolate_planar_face_fields(query_points, face_fields, operators):
     scalar_input = face_fields.ndim == 1
     if scalar_input:
         face_fields = face_fields[:, None]
-    gradients = face_field_gradients(face_fields, operators)
+    gradients = face_gradient(face_fields, operators)
     offsets = query - operators["face_centers"][simplex, :2]
     samples = face_fields[simplex] + np.einsum(
         "nsi,ni->ns", gradients[simplex], offsets
@@ -688,7 +954,7 @@ def compose_planar_backmap(local_lambda, reference_to_initial, operators):
 
 def clebsch_vorticity(chart_fields, operators):
     """Evaluate sum_a det(grad(mu_a), grad(lambda_a)) on each face."""
-    gradients = face_field_gradients(chart_fields, operators)
+    gradients = face_gradient(chart_fields, operators)
     result = np.zeros(len(operators["faces"]))
     for mu_index, lambda_index in ((MU1, LAMBDA1), (MU2, LAMBDA2)):
         grad_mu = gradients[:, mu_index]
@@ -697,13 +963,58 @@ def clebsch_vorticity(chart_fields, operators):
     return result
 
 
-def recovered_velocity_vorticity(edge_flux, operators):
+def weak_rt0_vertex_vorticity(edge_flux, operators):
+    """Mass-lumped P1 weak curl of the projected RT0/H(div) velocity.
+
+    A divergence-free RT0 field is constant inside each triangle, so taking a
+    strong facewise curl would return zero and differentiating a separately
+    smoothed face reconstruction amplifies O(h) velocity error.  Instead use
+    the distributional identity
+
+        int omega phi = int (u_x phi_y - u_y phi_x)
+                        + int_boundary phi (u . t),
+
+    project it to vertex P1 values with the barycentric lumped mass, and average
+    those vertex values back to triangle centroids for facewise diagnostics.
+    """
     face_velocity = edge_flux_to_face_vectors(edge_flux, operators)
-    vertex_velocity = face_vectors_to_vertex_vectors(face_velocity, operators)
-    gradients = np.einsum(
-        "fvi,fvc->fci", operators["gradients"], vertex_velocity[operators["faces"]]
+    face_areas = operators["face_areas"]
+    basis_gradients = operators["p1_basis_derivatives"]
+    faces = operators["faces"]
+
+    face_weak_curl = face_areas[:, None] * (
+        face_velocity[:, 0, None] * basis_gradients[:, :, 1]
+        - face_velocity[:, 1, None] * basis_gradients[:, :, 0]
     )
-    return gradients[:, 1, 0] - gradients[:, 0, 1]
+    vertex_rhs = np.zeros(len(operators["vertices"]))
+    np.add.at(vertex_rhs, faces.ravel(), face_weak_curl.ravel())
+
+    boundary_edges = operators["boundary_edge_indices"]
+    if len(boundary_edges):
+        boundary_velocity = face_velocity[operators["boundary_edge_faces"]]
+        boundary_circulation = (
+            operators["edge_lengths"][boundary_edges]
+            * np.sum(
+                boundary_velocity * operators["boundary_ccw_tangents"], axis=1
+            )
+        )
+        endpoints = operators["edges"][boundary_edges]
+        np.add.at(vertex_rhs, endpoints[:, 0], 0.5 * boundary_circulation)
+        np.add.at(vertex_rhs, endpoints[:, 1], 0.5 * boundary_circulation)
+
+    return vertex_rhs / np.maximum(operators["star0"], 1e-15)
+
+
+def recovered_velocity_vorticity(edge_flux, operators):
+    """Face samples of the weak RT0 curl, used only for visualization."""
+    vertex_vorticity = weak_rt0_vertex_vorticity(edge_flux, operators)
+    return np.mean(vertex_vorticity[operators["faces"]], axis=1)
+
+
+def physical_enstrophy(edge_flux, operators):
+    """Discrete enstrophy 1/2 * omega^T M_lumped omega from projected velocity."""
+    omega = weak_rt0_vertex_vorticity(edge_flux, operators)
+    return 0.5 * float(operators["star0"] @ (omega * omega))
 
 
 def relative_divergence(edge_flux, operators):
@@ -713,18 +1024,61 @@ def relative_divergence(edge_flux, operators):
 
 
 def kinetic_energy(edge_flux, operators):
-    vectors = edge_flux_to_face_vectors(edge_flux, operators)
-    return 0.5 * np.sum(operators["face_areas"] * np.sum(vectors * vectors, axis=1))
+    edge_flux = np.asarray(edge_flux)
+    return 0.5 * float(edge_flux @ (operators["edge_flux_mass"] @ edge_flux))
 
 
-def relative_vorticity_l2_change(vorticity, initial_vorticity, face_areas):
-    """Return the area-weighted L2 change from the initial vorticity, in percent."""
-    difference = np.asarray(vorticity) - np.asarray(initial_vorticity)
-    numerator = np.sqrt(np.sum(face_areas * difference * difference, axis=-1))
-    initial_norm = np.sqrt(
-        np.sum(face_areas * np.asarray(initial_vorticity) ** 2)
+def relative_vorticity_l2_error(vorticity_history, face_areas):
+    """Eulerian field displacement, not a 2D Euler conservation error.
+
+    Returns 100 ||omega(.,t)-omega(.,0)||_L2 / ||omega(.,0)||_L2.  A general
+    incompressible Euler solution advects vorticity, so this quantity may be
+    large even for an exact solution.
+    """
+    vorticity_history = np.asarray(vorticity_history)
+    initial_field = vorticity_history[0]
+    delta_vorticity = vorticity_history - initial_field
+    delta_norm = np.sqrt(
+        np.sum(face_areas * delta_vorticity * delta_vorticity, axis=-1)
     )
-    return 100.0 * numerator / max(float(initial_norm), 1e-15)
+    initial_norm = np.sqrt(np.sum(face_areas * initial_field**2))
+    return 100.0 * delta_norm / max(float(initial_norm), 1e-15)
+
+
+def relative_enstrophy_change(vorticity_history, face_areas):
+    """Percent change of integral omega^2, a genuine 2D Euler Casimir."""
+    vorticity_history = np.asarray(vorticity_history)
+    enstrophy = np.sum(face_areas * vorticity_history * vorticity_history, axis=-1)
+    return 100.0 * (enstrophy / max(float(enstrophy[0]), 1e-15) - 1.0)
+
+
+def material_vorticity_relative_l2_error(
+    vorticity_history, material_fields_history, face_areas, settings: Settings
+):
+    """Compare omega(x,t) with the advected target omega_0(A(x,t))."""
+    vorticity_history = np.asarray(vorticity_history)
+    material_fields_history = np.asarray(material_fields_history)
+    labels = material_fields_history[:, :, LAMBDA1:LAMBDA2 + 1]
+    target = initial_vorticity(labels[:, :, 0], labels[:, :, 1], settings)
+    difference = vorticity_history - target
+    numerator = np.sqrt(np.sum(face_areas * difference * difference, axis=-1))
+    denominator = np.sqrt(np.sum(face_areas * target * target, axis=-1))
+    return 100.0 * numerator / np.maximum(denominator, 1e-15)
+
+
+def relative_l2_to_target(field_history, target_history, face_areas):
+    """Return 100 ||field-target||_L2 / ||target||_L2 at each stored time."""
+    field_history = np.asarray(field_history)
+    target_history = np.asarray(target_history)
+    difference = field_history - target_history
+    numerator = np.sqrt(np.sum(face_areas * difference * difference, axis=-1))
+    denominator = np.sqrt(np.sum(face_areas * target_history * target_history, axis=-1))
+    return 100.0 * numerator / np.maximum(denominator, 1e-15)
+
+
+def relative_l2_between_histories(first, second, face_areas):
+    """Return 100 ||first-second||_L2 / ||second||_L2 at each stored time."""
+    return relative_l2_to_target(first, second, face_areas)
 
 
 def scalar_invariants(transported_fields, operators):
@@ -754,54 +1108,53 @@ def stable_time_step(edge_flux, operators, settings: Settings):
     return min(settings.maximum_time_step, settings.cfl / maximum_rate), maximum_rate
 
 
-def rechart(chart_fields, edge_flux, reference_to_initial, operators):
-    """Fit a fresh identity-label chart to the current projected edge flux."""
-    edge_flux_before = edge_flux.copy()
+def rechart(chart_fields, edge_flux, reference_to_initial, operators, settings: Settings):
+    """Constrained identity-chart reparameterization.
+
+    The new labels are x,y. Their coefficient vector c=(mu_1,mu_2) is chosen
+    by a fixed sparse KKT solve that enforces N c = F exactly, where F is the
+    current projected edge flux, while minimizing the discrepancy between the
+    new identity-chart curl C c and the pre-reset Clebsch curl. A tiny
+    minimum-change term selects a stable representative.
+    """
+    edge_flux_before = np.asarray(edge_flux).copy()
     global_labels_before = compose_planar_backmap(
         chart_fields[:, LAMBDA1:LAMBDA2 + 1], reference_to_initial, operators
     )
-    reset_chart = chart_fields.copy()
-    interior = operators["interior_edges"]
-    recovery_matrix = operators["identity_chart_flux_matrix"][interior]
-    face_velocity = edge_flux_to_face_vectors(edge_flux, operators)
-    baseline_coefficients = np.concatenate(
-        (face_velocity[:, 0], face_velocity[:, 1])
-    )
-    residual_target = (
-        edge_flux[interior] - recovery_matrix @ baseline_coefficients
-    )
-    row_scale = np.sqrt(
-        np.mean(np.asarray(recovery_matrix.multiply(recovery_matrix).sum(axis=1)).ravel())
-    )
-    fit = lsqr(
-        # The face system has more coefficient unknowns than interior-edge
-        # targets.  A light minimum-change damping selects a stable solution
-        # without sacrificing the flux transfer at every rechart.
-        recovery_matrix, residual_target, damp=0.01 * max(row_scale, 1e-15),
-        atol=1e-11, btol=1e-11, iter_lim=4 * recovery_matrix.shape[1],
-    )
-    recovered_coefficients = baseline_coefficients + fit[0]
-    if not np.all(np.isfinite(recovered_coefficients)):
-        raise FloatingPointError("non-finite Clebsch rechart fit")
+    target_curl = clebsch_vorticity(chart_fields, operators)
+    face_velocity = edge_flux_to_face_vectors(edge_flux_before, operators)
+    baseline = np.concatenate((face_velocity[:, 0], face_velocity[:, 1]))
 
-    fitted_raw_flux = np.asarray(
-        recovery_matrix @ recovered_coefficients
-    ).ravel()
-    fit_relative_residual = np.linalg.norm(
-        fitted_raw_flux - edge_flux[interior]
-    ) / max(np.linalg.norm(edge_flux[interior]), 1e-15)
+    coefficient_rhs = np.asarray(
+        operators["rechart_curl_rhs"] @ target_curl
+    ).ravel() + operators["rechart_beta"] * baseline
+    rhs = np.concatenate((coefficient_rhs, edge_flux_before))
+    solution = operators["rechart_factorization"].solve(rhs)
     number_of_faces = len(operators["faces"])
-    reset_chart[:, MU1] = recovered_coefficients[:number_of_faces]
-    reset_chart[:, MU2] = recovered_coefficients[number_of_faces:]
+    coefficients = solution[: 2 * number_of_faces]
+    if not np.all(np.isfinite(coefficients)):
+        raise FloatingPointError("non-finite constrained Clebsch rechart")
+
+    reset_chart = chart_fields.copy()
+    reset_chart[:, MU1] = coefficients[:number_of_faces]
+    reset_chart[:, MU2] = coefficients[number_of_faces:]
     reset_chart[:, LAMBDA1] = operators["face_centers"][:, 0]
     reset_chart[:, LAMBDA2] = operators["face_centers"][:, 1]
-    projection_potential, edge_flux_after = reconstruct_and_project(
+
+    projection_multiplier, edge_flux_after = reconstruct_and_project(
         reset_chart, operators
     )
     new_reference_to_initial = global_labels_before.copy()
     global_labels_after = compose_planar_backmap(
         reset_chart[:, LAMBDA1:LAMBDA2 + 1], new_reference_to_initial, operators
     )
+
+    raw_flux_after = face_vectors_to_edge_flux(
+        reset_chart[:, MU1:MU2 + 1], operators
+    )
+    raw_flux_residual = np.linalg.norm(
+        raw_flux_after - edge_flux_before
+    ) / max(np.linalg.norm(edge_flux_before), 1e-15)
     relative_velocity_jump = np.linalg.norm(
         edge_flux_after - edge_flux_before
     ) / max(np.linalg.norm(edge_flux_before), 1e-15)
@@ -809,10 +1162,19 @@ def rechart(chart_fields, edge_flux, reference_to_initial, operators):
     relative_energy_jump = (
         kinetic_energy(edge_flux_after, operators) - energy_before
     ) / max(energy_before, 1e-15)
+
+    curl_after = clebsch_vorticity(reset_chart, operators)
+    face_areas = operators["face_areas"]
+    curl_scale = np.sqrt(np.sum(face_areas * target_curl**2))
+    clebsch_curl_jump = np.sqrt(
+        np.sum(face_areas * (curl_after - target_curl)**2)
+    ) / max(float(curl_scale), 1e-15)
+
     transition = {
-        "velocity_jump": relative_velocity_jump,
-        "energy_jump": relative_energy_jump,
-        "fit_relative_residual": float(fit_relative_residual),
+        "velocity_jump": float(relative_velocity_jump),
+        "energy_jump": float(relative_energy_jump),
+        "raw_flux_residual": float(raw_flux_residual),
+        "clebsch_curl_jump": float(clebsch_curl_jump),
         "global_label_jump": float(
             np.max(
                 np.linalg.norm(global_labels_after - global_labels_before, axis=1),
@@ -821,29 +1183,36 @@ def rechart(chart_fields, edge_flux, reference_to_initial, operators):
         ),
     }
     return (
-        reset_chart,
-        projection_potential,
-        edge_flux_after,
-        new_reference_to_initial,
-        transition,
+        reset_chart, projection_multiplier, edge_flux_after,
+        new_reference_to_initial, transition,
     )
-
 
 def simulate(operators, settings: Settings):
     material_fields, dye = initialize_fields(operators, settings)
     chart_fields = material_fields.copy()
-    projection_potential, edge_flux = reconstruct_and_project(
-        chart_fields, operators
-    )
-    reference_to_initial = operators["face_centers"][:, :2].copy()
+    centers = operators["face_centers"]
+    reference_to_initial = centers[:, :2].copy()
+
+    # Start from the analytic identity Clebsch chart itself.  Do not perform an
+    # LSQR calibration to the exact edge flux: that made the projected velocity
+    # nearly exact while substantially corrupting the hidden Clebsch curl.
+    projection_multiplier, edge_flux = reconstruct_and_project(chart_fields, operators)
+    exact_flux = exact_initial_edge_flux(operators, settings)
+    initial_flux_transfer_error = np.linalg.norm(
+        edge_flux - exact_flux
+    ) / max(np.linalg.norm(exact_flux), 1e-15)
+    initial_transition = None
+
     output_times = np.linspace(0.0, settings.final_time, settings.frames)
     histories = {
         "times": [], "material_fields": [], "dye": [],
-        "projection_potential": [], "edge_fluxes": [], "composition_error": [],
-        "clebsch_vorticity": [], "velocity_vorticity": [],
+        "projection_multiplier": [], "edge_fluxes": [],
+        "composition_error": [], "local_clebsch_vorticity": [],
+        "velocity_vorticity": [],
         "log_sigma_max": [], "log_condition": [], "determinant": [],
-        "divergence": [], "boundary_error": [], "energy": [],
-        "mass": [], "l2": [], "maximum_speed": [], "step_cfl": [],
+        "material_max_log_condition": [], "divergence": [], "boundary_error": [],
+        "energy": [], "physical_enstrophy": [], "mass": [], "l2": [],
+        "maximum_speed": [], "step_cfl": [],
         "chart": [], "chart_age": [],
     }
     reset_events = []
@@ -860,41 +1229,40 @@ def simulate(operators, settings: Settings):
         log_sigma, log_condition, determinant, _ = chart_metrics(
             chart_fields, operators
         )
+        _, material_log_condition, _, _ = chart_metrics(material_fields, operators)
         composed_labels = compose_planar_backmap(
             chart_fields[:, LAMBDA1:LAMBDA2 + 1],
-            reference_to_initial,
-            operators,
+            reference_to_initial, operators,
         )
         material_labels = material_fields[:, LAMBDA1:LAMBDA2 + 1]
-        omega_c = clebsch_vorticity(chart_fields, operators)
+        omega_local = clebsch_vorticity(chart_fields, operators)
         omega_u = recovered_velocity_vorticity(edge_flux, operators)
         clebsch_mass, clebsch_l2 = scalar_invariants(material_fields, operators)
         dye_mass, dye_l2 = vertex_scalar_invariants(dye, operators)
         mass = np.concatenate((clebsch_mass, (dye_mass,)))
         l2 = np.concatenate((clebsch_l2, (dye_l2,)))
         face_velocity = edge_flux_to_face_vectors(edge_flux, operators)
+
         histories["times"].append(current_time)
         histories["material_fields"].append(material_fields.copy())
         histories["dye"].append(dye.copy())
         histories["composition_error"].append(
             np.linalg.norm(composed_labels - material_labels, axis=1)
         )
-        histories["projection_potential"].append(projection_potential.copy())
+        histories["projection_multiplier"].append(projection_multiplier.copy())
         histories["edge_fluxes"].append(edge_flux.copy())
-        histories["clebsch_vorticity"].append(omega_c)
+        histories["local_clebsch_vorticity"].append(omega_local)
         histories["velocity_vorticity"].append(omega_u)
         histories["log_sigma_max"].append(log_sigma)
         histories["log_condition"].append(log_condition)
         histories["determinant"].append(determinant)
+        histories["material_max_log_condition"].append(float(np.max(material_log_condition)))
         histories["divergence"].append(relative_divergence(edge_flux, operators))
-        histories["boundary_error"].append(
-            float(
-                np.max(
-                    np.abs(edge_flux[operators["boundary_edges"]]), initial=0.0
-                )
-            )
-        )
+        histories["boundary_error"].append(float(
+            np.max(np.abs(edge_flux[operators["boundary_edges"]]), initial=0.0)
+        ))
         histories["energy"].append(kinetic_energy(edge_flux, operators))
+        histories["physical_enstrophy"].append(physical_enstrophy(edge_flux, operators))
         histories["mass"].append(mass)
         histories["l2"].append(l2)
         histories["maximum_speed"].append(float(np.max(np.linalg.norm(face_velocity, axis=1))))
@@ -904,33 +1272,23 @@ def simulate(operators, settings: Settings):
         maximum_start_state_cfl_since_output = 0.0
 
     def apply_rechart(reason, log_sigma, determinant):
-        nonlocal chart_fields, projection_potential, edge_flux
+        nonlocal chart_fields, projection_multiplier, edge_flux
         nonlocal reference_to_initial, chart_index, chart_start, last_rechart_time
         (
-            chart_fields,
-            projection_potential,
-            edge_flux,
-            reference_to_initial,
-            transition,
+            chart_fields, projection_multiplier, edge_flux,
+            reference_to_initial, transition,
         ) = rechart(
-            chart_fields,
-            edge_flux,
-            reference_to_initial,
-            operators,
+            chart_fields, edge_flux, reference_to_initial, operators, settings
         )
         chart_index += 1
         chart_start = current_time
         last_rechart_time = current_time
-        reset_events.append(
-            {
-                "time": current_time,
-                "chart": chart_index,
-                "reason": reason,
-                "pre_log_sigma_max": float(np.max(log_sigma)),
-                "pre_min_determinant": float(np.min(determinant)),
-                **transition,
-            }
-        )
+        reset_events.append({
+            "time": current_time, "chart": chart_index, "reason": reason,
+            "pre_log_sigma_max": float(np.max(log_sigma)),
+            "pre_min_determinant": float(np.min(determinant)),
+            **transition,
+        })
 
     store()
     next_output = 1
@@ -942,24 +1300,16 @@ def simulate(operators, settings: Settings):
         target = output_times[next_output] if next_output < len(output_times) else settings.final_time
         dt = min(proposed_dt, target - current_time, settings.final_time - current_time)
         if not np.isfinite(dt) or dt <= tolerance:
-            maximum_speed = float(
-                np.max(
-                    np.linalg.norm(
-                        edge_flux_to_face_vectors(edge_flux, operators), axis=1
-                    )
-                )
-            )
+            maximum_speed = float(np.max(np.linalg.norm(
+                edge_flux_to_face_vectors(edge_flux, operators), axis=1
+            )))
             raise FloatingPointError(
                 "CFL step collapsed before the next output: "
                 f"t={current_time:.12g}, dt={dt:.3e}, "
                 f"proposed_dt={proposed_dt:.3e}, max_speed={maximum_speed:.3e}"
             )
         (
-            chart_fields,
-            material_fields,
-            dye,
-            projection_potential,
-            edge_flux,
+            chart_fields, material_fields, dye, projection_multiplier, edge_flux,
         ) = ssprk3_step(
             chart_fields, material_fields, dye, dt, operators, settings
         )
@@ -972,15 +1322,15 @@ def simulate(operators, settings: Settings):
             np.all(np.isfinite(chart_fields))
             and np.all(np.isfinite(material_fields))
             and np.all(np.isfinite(dye))
-            and np.all(np.isfinite(projection_potential))
+            and np.all(np.isfinite(projection_multiplier))
             and np.all(np.isfinite(edge_flux))
         )
         if not finite_state:
-            raise FloatingPointError(f"solution became non-finite at step {step}, t={current_time:.6g}")
+            raise FloatingPointError(
+                f"solution became non-finite at step {step}, t={current_time:.6g}"
+            )
 
-        log_sigma, _, determinant, sigma_min = chart_metrics(
-            chart_fields, operators
-        )
+        log_sigma, _, determinant, sigma_min = chart_metrics(chart_fields, operators)
         trigger_reasons = []
         if float(np.max(log_sigma)) > settings.rechart_cutoff:
             trigger_reasons.append("sigma_max")
@@ -999,151 +1349,32 @@ def simulate(operators, settings: Settings):
                 and abs(current_time - last_rechart_time) > tolerance
             )
             if scheduled_rechart:
-                log_sigma, _, determinant, _ = chart_metrics(
-                    chart_fields, operators
-                )
+                log_sigma, _, determinant, _ = chart_metrics(chart_fields, operators)
                 apply_rechart("frame interval", log_sigma, determinant)
             store()
             next_output += 1
 
     result = {key: np.asarray(value) for key, value in histories.items()}
-    result["velocity_vorticity_change"] = relative_vorticity_l2_change(
-        result["velocity_vorticity"],
-        result["velocity_vorticity"][0],
-        operators["face_areas"],
+    areas = operators["face_areas"]
+    result["physical_enstrophy_change"] = 100.0 * (
+        result["physical_enstrophy"]
+        / max(float(result["physical_enstrophy"][0]), 1e-15)
+        - 1.0
     )
-    result["clebsch_vorticity_change"] = relative_vorticity_l2_change(
-        result["clebsch_vorticity"],
-        result["clebsch_vorticity"][0],
-        operators["face_areas"],
-    )
+    result["initial_flux_transfer_error"] = float(initial_flux_transfer_error)
+    result["initial_rechart_transition"] = initial_transition
     for key in (
-        "material_fields", "dye", "composition_error", "projection_potential",
-        "edge_fluxes", "clebsch_vorticity", "velocity_vorticity",
-        "log_sigma_max", "log_condition", "determinant",
+        "material_fields", "dye", "composition_error",
+        "projection_multiplier", "edge_fluxes", "local_clebsch_vorticity",
+        "velocity_vorticity", "log_sigma_max", "log_condition", "determinant",
     ):
         result[key] = result[key].astype(np.float32)
     result["reset_events"] = reset_events
     result["number_of_steps"] = step
     return result
 
-
 def percentage_change(values, frame=-1):
     return 100.0 * (values[frame] / max(abs(values[0]), 1e-15) - 1.0)
-
-
-def diagnostic_time_series(result):
-    """Return the scalar histories used by the diagnostic time-series plot.
-
-    This is deliberately a post-processing helper: it does not alter any
-    state used by the simulation or visualization.  The vorticity entries are
-    the area-weighted relative L2 differences already computed by
-    :func:`simulate`, not changes in the scalar vorticity norm.
-    """
-    energy = np.asarray(result["energy"], dtype=float)
-    return {
-        "time": np.asarray(result["times"], dtype=float),
-        "relative_divergence": np.asarray(result["divergence"], dtype=float),
-        "energy_change_percent": 100.0 * (
-            energy / max(abs(float(energy[0])), 1e-15) - 1.0
-        ),
-        "velocity_vorticity_change_percent": np.asarray(
-            result["velocity_vorticity_change"], dtype=float
-        ),
-        "clebsch_vorticity_change_percent": np.asarray(
-            result["clebsch_vorticity_change"], dtype=float
-        ),
-    }
-
-
-def plot_diagnostic_histories(result, settings: Settings, output_path=None, show=False):
-    """Plot divergence, energy, and vorticity diagnostics versus physical time.
-
-    ``output_path`` is normalized to a PNG path and its parent directory is
-    created if necessary.  Matplotlib is imported only when this optional
-    function is requested, so it is not a dependency of ordinary solver runs.
-    """
-    try:
-        import matplotlib.pyplot as plt
-    except ImportError as error:
-        raise RuntimeError(
-            "diagnostic plotting requires matplotlib; install it or omit "
-            "--diagnostics-plot/--show-diagnostic-plots"
-        ) from error
-
-    series = diagnostic_time_series(result)
-    times = series["time"]
-    figure, axes = plt.subplots(
-        3, 1, figsize=(8.0, 8.5), sharex=True, constrained_layout=True
-    )
-
-    # A log axis cannot display exact zeros.  Clipping is only a display
-    # operation; the stored divergence history remains unchanged.
-    log_floor = 1e-18
-    plotted_divergence = np.maximum(
-        np.abs(series["relative_divergence"]), log_floor
-    )
-    axes[0].semilogy(
-        times, plotted_divergence, color="tab:blue", linewidth=1.8,
-        label=r"relative divergence $\epsilon_{\mathrm{div}}$",
-    )
-    axes[0].axhline(
-        log_floor, color="0.55", linewidth=0.8, linestyle=":",
-        label=rf"display floor $10^{{{int(np.log10(log_floor))}}}$",
-    )
-    axes[0].set_ylabel("Relative divergence")
-    axes[0].legend(loc="best", fontsize=8)
-
-    axes[1].plot(
-        times, series["energy_change_percent"], color="tab:green", linewidth=1.8
-    )
-    axes[1].axhline(0.0, color="0.45", linewidth=0.8, linestyle=":")
-    axes[1].set_ylabel("Relative energy change [%]")
-
-    axes[2].plot(
-        times, series["velocity_vorticity_change_percent"],
-        color="tab:red", linewidth=1.8,
-        label="from projected edge velocity",
-    )
-    axes[2].plot(
-        times, series["clebsch_vorticity_change_percent"],
-        color="tab:purple", linewidth=1.8, linestyle="--",
-        label="from Clebsch gradients",
-    )
-    axes[2].axhline(0.0, color="0.45", linewidth=0.8, linestyle=":")
-    axes[2].set_ylabel(r"Relative vorticity $L^2$ difference [\%]")
-    axes[2].set_xlabel("Physical time")
-    axes[2].legend(loc="best", fontsize=8)
-
-    for event_index, event in enumerate(result.get("reset_events", [])):
-        label = "rechart" if event_index == 0 else None
-        for axis in axes:
-            axis.axvline(
-                float(event["time"]), color="0.35", linewidth=0.7,
-                linestyle="--", alpha=0.35, label=label,
-            )
-    if result.get("reset_events"):
-        axes[0].legend(loc="best", fontsize=8)
-
-    for axis in axes:
-        axis.grid(True, which="both", linewidth=0.45, alpha=0.3)
-        axis.margins(x=0.0)
-    figure.suptitle(
-        f"2D Clebsch Euler diagnostics: {initial_condition_label(settings)}"
-    )
-
-    saved_path = None
-    if output_path is not None:
-        saved_path = Path(output_path).expanduser()
-        if saved_path.suffix.lower() != ".png":
-            saved_path = saved_path.with_suffix(".png")
-        saved_path.parent.mkdir(parents=True, exist_ok=True)
-        figure.savefig(saved_path, dpi=200, bbox_inches="tight", format="png")
-        print(f"Diagnostic time-series plot:    {saved_path.resolve()}")
-    if show:
-        plt.show()
-    plt.close(figure)
-    return saved_path
 
 
 def visualization_limits(values, signed):
@@ -1173,33 +1404,51 @@ def visualize(result, operators, settings: Settings):
     vertex_velocity_change = vertex_velocities - vertex_velocities[0]
     determinant_error = result["determinant"] - 1.0
     names = (
-        "Speed |u|", "Local-chart Clebsch vorticity", "Recovered velocity vorticity",
-        "Velocity change", "log(sigma_max)", "log(condition number)",
-        "det(Dlambda_local)-1", "mu_1 (material, face-based)",
-        "mu_2 (material, face-based)", "lambda_1 = Psi_0 X (face-based)",
-        "lambda_2 = Psi_0 Y (face-based)", "Persistent dye (vertex-based)",
-        "Projection potential Phi", "Chart-composition label error",
+        "Speed |u|",
+        "Physical vorticity (weak RT0 curl)",
+        "Local-chart Clebsch vorticity (debug)",
+        "Velocity change",
+        "log(sigma_max)",
+        "log(condition number)",
+        "det(Dlambda_local)-1",
+        "mu_1 (material, face-based)",
+        "mu_2 (material, face-based)",
+        "lambda_1 = Psi_0 X (face-based)",
+        "lambda_2 = Psi_0 Y (face-based)",
+        "Persistent dye (vertex-based)",
+        "Hodge constraint multiplier",
+        "Chart-composition label error",
     )
     speed_view = 0
     velocity_change_view = 3
     dye_view = 11
     material_views = {7: MU1, 8: MU2, 9: LAMBDA1, 10: LAMBDA2}
     scalar_data = (
-        face_speed, result["clebsch_vorticity"], result["velocity_vorticity"],
+        face_speed,
+        result["velocity_vorticity"],
+        result["local_clebsch_vorticity"],
         np.linalg.norm(face_velocity_change, axis=2),
-        result["log_sigma_max"], result["log_condition"],
-        determinant_error, result["material_fields"][:, :, MU1],
+        result["log_sigma_max"], result["log_condition"], determinant_error,
+        result["material_fields"][:, :, MU1],
         result["material_fields"][:, :, MU2],
         result["material_fields"][:, :, LAMBDA1],
         result["material_fields"][:, :, LAMBDA2],
-        result["dye"], result["projection_potential"],
-        result["composition_error"],
+        result["dye"], result["projection_multiplier"], result["composition_error"],
     )
     vertex_fields = {dye_view}
     sequential_fields = {0, velocity_change_view, 5, dye_view, 13}
-    defined_on = tuple("vertices" if index in vertex_fields else "faces" for index in range(len(names)))
-    color_maps = tuple("viridis" if index in sequential_fields else "coolwarm" for index in range(len(names)))
-    limits = [visualization_limits(data, index not in sequential_fields) for index, data in enumerate(scalar_data)]
+    defined_on = tuple(
+        "vertices" if index in vertex_fields else "faces"
+        for index in range(len(names))
+    )
+    color_maps = tuple(
+        "viridis" if index in sequential_fields else "coolwarm"
+        for index in range(len(names))
+    )
+    limits = [
+        visualization_limits(data, index not in sequential_fields)
+        for index, data in enumerate(scalar_data)
+    ]
     limits[speed_view] = (
         0.0,
         max(
@@ -1374,9 +1623,9 @@ def visualize(result, operators, settings: Settings):
             psim.TextUnformatted(
                 f"Initial condition: {initial_condition_label(settings)}"
             )
-            psim.TextUnformatted(f"SSPRK3; stabilization: {settings.stabilization}")
+            psim.TextUnformatted(f"SSPRK3; Clebsch stabilization: {settings.stabilization}")
             psim.TextUnformatted(
-                "Phi is an auxiliary face projection potential; it is not transported"
+                "The Hodge multiplier enforces divergence; it is not a physical gradient"
             )
             psim.TextUnformatted(f"Frame: {frame + 1}/{len(result['times'])}; t={result['times'][frame]:.5f}")
             psim.TextUnformatted(f"Chart: {int(result['chart'][frame])}; age={result['chart_age'][frame]:.4f}")
@@ -1391,12 +1640,12 @@ def visualize(result, operators, settings: Settings):
             psim.TextUnformatted(f"Boundary-normal error: {result['boundary_error'][frame]:.3e}")
             psim.TextUnformatted(f"Energy change: {percentage_change(result['energy'], frame):+.3e}%")
             psim.TextUnformatted(
-                "Recovered-u vorticity L2 change: "
-                f"{result['velocity_vorticity_change'][frame]:.3e}%"
+                "Physical enstrophy change: "
+                f"{result['physical_enstrophy_change'][frame]:+.3e}%"
             )
             psim.TextUnformatted(
-                "Clebsch vorticity L2 change: "
-                f"{result['clebsch_vorticity_change'][frame]:.3e}%"
+                "Max log(condition(Dlambda_material)): "
+                f"{result['material_max_log_condition'][frame]:.3e}"
             )
             psim.TextUnformatted(f"Dye mass change: {100.0 * (result['mass'][frame, DYE_INDEX] - result['mass'][0, DYE_INDEX]) / max(abs(result['mass'][0, DYE_INDEX]), 1e-15):+.3e}%")
             dye_l2_loss = 100.0 * (
@@ -1424,7 +1673,7 @@ def visualize(result, operators, settings: Settings):
                 f"{material_mu_l2_loss[0]:+.3e}% / {material_mu_l2_loss[1]:+.3e}%"
             )
             psim.TextUnformatted(f"Recharts so far: {int(result['chart'][frame])}")
-            psim.TextUnformatted(f"Scheduled rechart interval: {settings.rechart_every_frames} frames")
+            psim.TextUnformatted("Rechart mode: adaptive only" if settings.rechart_every_frames == 0 else f"Scheduled rechart interval: {settings.rechart_every_frames} frames")
             psim.TextUnformatted(
                 "Display smoothing only; face Clebsch state and DEC flux are unchanged"
                 if smooth_display
@@ -1442,13 +1691,21 @@ def visualize(result, operators, settings: Settings):
 
 
 def print_report(result, operators, settings: Settings):
-    initial_face_velocity = edge_flux_to_face_vectors(result["edge_fluxes"][0], operators)
     centers = operators["face_centers"]
     analytic = initial_velocity(centers[:, 0], centers[:, 1], settings)
-    initial_error = np.sqrt(
-        np.sum(operators["face_areas"] * np.sum((initial_face_velocity - analytic) ** 2, axis=1))
-        / max(np.sum(operators["face_areas"] * np.sum(analytic ** 2, axis=1)), 1e-15)
+    initial_material, _ = initialize_fields(operators, settings)
+    raw_velocity = clebsch_face_velocity(initial_material, operators)
+    projected_velocity = edge_flux_to_face_vectors(result["edge_fluxes"][0], operators)
+    analytic_norm_squared = np.sum(
+        operators["face_areas"] * np.sum(analytic * analytic, axis=1)
     )
+    raw_error = np.sqrt(np.sum(
+        operators["face_areas"] * np.sum((raw_velocity - analytic) ** 2, axis=1)
+    ) / max(analytic_norm_squared, 1e-15))
+    projected_error = np.sqrt(np.sum(
+        operators["face_areas"] * np.sum((projected_velocity - analytic) ** 2, axis=1)
+    ) / max(analytic_norm_squared, 1e-15))
+
     print(f"Initial condition:              {initial_condition_label(settings)}")
     print(f"Vertices / edges / triangles:   {len(operators['vertices']):,} / {len(operators['edges']):,} / {len(operators['faces']):,}")
     print(
@@ -1456,26 +1713,29 @@ def print_report(result, operators, settings: Settings):
         f"{np.min(operators['minimum_angles']):.3f} deg / "
         f"{np.max(operators['aspect_ratios']):.3f}"
     )
+    print(f"G_F coordinate affine error:    {operators['affine_gradient_error']:.6e}")
+    print(f"R_F->E affine edge error:       {operators['affine_edge_reconstruction_error']:.6e}")
     print(f"SSPRK3 accepted steps:          {result['number_of_steps']:,}")
     print(f"Maximum accepted start CFL:     {np.max(result['step_cfl']):.6e}")
-    if settings.stabilization == "graph":
-        print(f"Graph-viscosity coefficient:    {settings.graph_viscosity:.6e}")
+    print(f"Clebsch stabilization:          {settings.stabilization}")
     print(f"Scheduled rechart interval:     {settings.rechart_every_frames} frames")
-    print(f"Initial projected-velocity err: {initial_error:.6e}")
+    print(f"Initial raw Clebsch error:       {raw_error:.6e}")
+    print(f"Initial projected-velocity err: {projected_error:.6e}")
+    print(f"Initial edge-flux transfer err: {result['initial_flux_transfer_error']:.6e}")
     print(f"Maximum relative divergence:    {np.max(result['divergence']):.6e}")
     print(f"Maximum boundary-normal error:  {np.max(result['boundary_error']):.6e}")
     print(f"Kinetic-energy change:          {percentage_change(result['energy']):+.6e}%")
     print(
-        "Recovered-u vorticity L2 change: "
-        f"{result['velocity_vorticity_change'][-1]:.6e}%"
+        "Physical enstrophy change:            "
+        f"{result['physical_enstrophy_change'][-1]:+.6e}%"
     )
     print(
-        "Clebsch vorticity L2 change:     "
-        f"{result['clebsch_vorticity_change'][-1]:.6e}%"
+        "Max persistent-map log condition:    "
+        f"{np.max(result['material_max_log_condition']):.6e}"
     )
+
     clebsch_initial_l1 = np.sum(
-        operators["dual_star0"][:, None] * np.abs(result["material_fields"][0]),
-        axis=0,
+        operators["dual_star0"][:, None] * np.abs(result["material_fields"][0]), axis=0
     )
     dye_initial_l1 = operators["star0"] @ np.abs(result["dye"][0])
     initial_l1 = np.concatenate((clebsch_initial_l1, (dye_initial_l1,)))
@@ -1492,349 +1752,13 @@ def print_report(result, operators, settings: Settings):
         maximum_velocity_jump = max(event["velocity_jump"] for event in result["reset_events"])
         maximum_energy_jump = max(abs(event["energy_jump"]) for event in result["reset_events"])
         maximum_label_jump = max(event["global_label_jump"] for event in result["reset_events"])
-        maximum_fit_residual = max(
-            event["fit_relative_residual"] for event in result["reset_events"]
-        )
+        maximum_raw_flux_residual = max(event["raw_flux_residual"] for event in result["reset_events"])
+        maximum_curl_jump = max(event["clebsch_curl_jump"] for event in result["reset_events"])
         print(f"Maximum reset velocity jump:    {maximum_velocity_jump:.6e}")
         print(f"Maximum reset energy jump:      {maximum_energy_jump:.6e}")
         print(f"Maximum global-label jump:      {maximum_label_jump:.6e}")
-        print(f"Maximum raw-flux fit residual:  {maximum_fit_residual:.6e}")
-
-
-def run_diagnostic_tests():
-    """Run focused algebra, transport, rechart, and nonlinear regressions."""
-    settings = Settings(
-        resolution=8,
-        final_time=0.1,
-        frames=11,
-        cfl=0.1,
-        maximum_time_step=0.005,
-        rechart_cutoff=99.0,
-        rechart_every_frames=0,
-        determinant_floor=0.0,
-        initial_condition=TAYLOR_GREEN,
-        perturbation_amplitude=0.0,
-        stabilization="centered",
-        graph_viscosity=0.0,
-        jitter=0.08,
-        random_seed=19,
-    )
-    operators = build_operators(settings)
-    clebsch, dye = initialize_fields(operators, settings)
-    _, edge_flux = reconstruct_and_project(clebsch, operators)
-    rng = np.random.default_rng(12345)
-    results = []
-
-    def check(name, error, tolerance):
-        passed = bool(np.isfinite(error) and error <= tolerance)
-        results.append(passed)
-        print(
-            f"[{'PASS' if passed else 'FAIL'}] {name:43s} "
-            f"error={error:.3e}  tolerance={tolerance:.3e}"
-        )
-
-    face_count = len(operators["faces"])
-    vertex_count = len(operators["vertices"])
-    sample_x = np.array((0.21, 1.07, 2.38))
-    sample_y = np.array((0.43, 1.61, 4.22))
-    expected_tgv = np.column_stack(
-        (
-            np.sin(sample_x) * np.cos(sample_y),
-            -np.cos(sample_x) * np.sin(sample_y),
-        )
-    )
-    check(
-        "Taylor--Green initializer matches formula",
-        np.max(np.abs(initial_velocity(sample_x, sample_y, settings) - expected_tgv)),
-        2e-15,
-    )
-    perturbed_settings = replace(
-        settings, initial_condition=PERTURBED, perturbation_amplitude=0.25
-    )
-    expected_perturbation = 0.25 * np.column_stack(
-        (
-            3.0 * np.sin(2.0 * sample_x) * np.cos(3.0 * sample_y),
-            -2.0 * np.cos(2.0 * sample_x) * np.sin(3.0 * sample_y),
-        )
-    )
-    check(
-        "perturbed initializer adds prescribed mode",
-        np.max(
-            np.abs(
-                initial_velocity(sample_x, sample_y, perturbed_settings)
-                - expected_tgv
-                - expected_perturbation
-            )
-        ),
-        2e-15,
-    )
-    try:
-        initial_velocity(
-            sample_x, sample_y,
-            replace(settings, initial_condition="not-a-valid-condition"),
-        )
-    except ValueError:
-        invalid_condition_error = 0.0
-    else:
-        invalid_condition_error = 1.0
-    check(
-        "initializer rejects unknown condition names",
-        invalid_condition_error,
-        0.0,
-    )
-    check(
-        "lambda/mu arrays are face-based",
-        float(clebsch.shape != (face_count, CLEBSCH_FIELD_COUNT)),
-        0.0,
-    )
-    check("passive dye remains vertex-based", float(dye.shape != (vertex_count,)), 0.0)
-    constant_velocity = np.tile((1.25, -0.75), (face_count, 1))
-    smoothed_velocity = face_vectors_to_vertex_vectors(
-        constant_velocity, operators
-    )
-    check(
-        "display projection preserves constant velocity",
-        np.max(np.abs(smoothed_velocity - (1.25, -0.75))),
-        2e-14,
-    )
-    constant_clebsch = np.tile((0.25, -0.5, 1.5, 2.0), (face_count, 1))
-    smoothed_clebsch = face_fields_to_vertex_fields(constant_clebsch, operators)
-    check(
-        "display projection preserves Clebsch fields",
-        np.max(np.abs(smoothed_clebsch - (0.25, -0.5, 1.5, 2.0))),
-        2e-14,
-    )
-    test_vorticity = np.array((1.0, -2.0, 0.5))
-    test_areas = np.array((0.25, 0.5, 1.5))
-    test_changes = relative_vorticity_l2_change(
-        np.vstack((test_vorticity, 1.25 * test_vorticity)),
-        test_vorticity,
-        test_areas,
-    )
-    check(
-        "vorticity metric is relative weighted L2",
-        np.max(np.abs(test_changes - (0.0, 25.0))),
-        2e-14,
-    )
-    check("incidence exactness ||d1 d0||", operators["exactness_error"], 1e-14)
-    vertex_xy = operators["vertices"][:, :2]
-    stream_function = np.sin(vertex_xy[:, 0]) * np.sin(vertex_xy[:, 1])
-    exact_tgv_flux = np.asarray(operators["d0"] @ stream_function).ravel()
-    exact_tgv_flux[operators["boundary_edges"]] = 0.0
-    check(
-        "exact Taylor--Green edge flux obeys constraints",
-        max(
-            np.linalg.norm(operators["d1"] @ exact_tgv_flux, np.inf),
-            np.max(
-                np.abs(exact_tgv_flux[operators["boundary_edges"]]),
-                initial=0.0,
-            ),
-        ),
-        2e-13,
-    )
-    check(
-        "dual gradient annihilates constants",
-        np.linalg.norm(dual_gradient(np.ones(face_count), operators), np.inf),
-        1e-14,
-    )
-    check(
-        "interior conductances are positive",
-        float(np.any(operators["conductance"][operators["interior_edges"]] <= 0.0)),
-        0.0,
-    )
-
-    raw_flux = rng.standard_normal(len(operators["edges"]))
-    _, projected = project_edge_flux(raw_flux, operators)
-    _, projected_twice = project_edge_flux(projected, operators)
-    check("projection is divergence-free", relative_divergence(projected, operators), 2e-12)
-    check(
-        "projection enforces impermeable boundary",
-        np.max(np.abs(projected[operators["boundary_edges"]]), initial=0.0),
-        1e-14,
-    )
-    check(
-        "projection is idempotent",
-        np.linalg.norm(projected_twice - projected)
-        / max(np.linalg.norm(projected), 1e-15),
-        2e-12,
-    )
-    gradient_flux = dual_gradient(rng.standard_normal(face_count), operators)
-    _, projected_gradient = project_edge_flux(gradient_flux, operators)
-    check(
-        "projection removes its discrete gradients",
-        np.linalg.norm(projected_gradient)
-        / max(np.linalg.norm(gradient_flux), 1e-15),
-        2e-11,
-    )
-
-    transport = centered_advection_matrix(edge_flux, operators)
-    face_mass = sp.diags(operators["dual_star0"])
-    weak_transport = (face_mass @ transport).tocsr()
-    ones = np.ones(face_count)
-    operator_scale = max(np.linalg.norm(transport.data, np.inf), 1.0)
-    weak_scale = max(np.linalg.norm(weak_transport.data), 1e-15)
-    check(
-        "face transport preserves constants",
-        np.linalg.norm(transport @ ones, np.inf) / operator_scale,
-        2e-12,
-    )
-    check(
-        "face transport preserves scalar mass",
-        np.linalg.norm(np.asarray(ones @ weak_transport).ravel(), np.inf)
-        / weak_scale,
-        2e-12,
-    )
-    check(
-        "centered face transport is weighted-skew",
-        np.linalg.norm((weak_transport + weak_transport.T).data) / weak_scale,
-        2e-12,
-    )
-    check(
-        "matrix and face-RHS implementations agree",
-        np.linalg.norm(
-            advection_rhs(clebsch, edge_flux, operators, settings)
-            - transport @ clebsch,
-            np.inf,
-        )
-        / max(np.linalg.norm(transport @ clebsch, np.inf), 1e-15),
-        2e-12,
-    )
-
-    dt, rate = stable_time_step(edge_flux, operators, settings)
-    check("adaptive step obeys requested CFL", max(0.0, dt * rate - settings.cfl), 2e-14)
-    evolved_chart, evolved_material, evolved_dye, _, evolved_flux = (
-        ssprk3_step(
-            clebsch, clebsch.copy(), dye, min(dt, 0.001), operators, settings
-        )
-    )
-    initial_mass = np.concatenate(
-        (
-            scalar_invariants(clebsch, operators)[0],
-            (vertex_scalar_invariants(dye, operators)[0],),
-        )
-    )
-    evolved_mass = np.concatenate(
-        (
-            scalar_invariants(evolved_material, operators)[0],
-            (vertex_scalar_invariants(evolved_dye, operators)[0],),
-        )
-    )
-    check(
-        "coupled SSPRK3 preserves transported mass",
-        np.linalg.norm(evolved_mass - initial_mass, np.inf)
-        / max(np.linalg.norm(initial_mass, np.inf), 1e-15),
-        2e-12,
-    )
-
-    reference_map = operators["face_centers"][:, :2].copy()
-    reset_chart, _, reset_flux, _, transition = rechart(
-        evolved_chart, evolved_flux, reference_map, operators
-    )
-    identity_error = np.max(
-        np.abs(
-            reset_chart[:, LAMBDA1:LAMBDA2 + 1]
-            - operators["face_centers"][:, :2]
-        )
-    )
-    check("rechart restores identity face labels", identity_error, 1e-14)
-    check("rechart preserves composed labels", transition["global_label_jump"], 2e-12)
-    check("rechart keeps velocity transfer small", transition["velocity_jump"], 2e-3)
-    check(
-        "recharted flux remains divergence-free",
-        relative_divergence(reset_flux, operators),
-        2e-12,
-    )
-
-    schedule_settings = replace(
-        settings,
-        resolution=6,
-        final_time=0.02,
-        frames=11,
-        maximum_time_step=0.002,
-        rechart_every_frames=5,
-        jitter=0.05,
-        random_seed=31,
-    )
-    schedule_operators = build_operators(schedule_settings)
-    scheduled = simulate(schedule_operators, schedule_settings)
-    expected_times = np.linspace(0.0, schedule_settings.final_time, schedule_settings.frames)
-    scheduled_events = [
-        event for event in scheduled["reset_events"]
-        if event["reason"] == "frame interval"
-    ]
-    event_times = np.asarray([event["time"] for event in scheduled_events])
-    schedule_error = (
-        np.max(np.abs(event_times - np.array((0.01, 0.02))))
-        if len(event_times) == 2
-        else np.inf
-    )
-    check(
-        "simulation stores every requested output",
-        np.max(np.abs(scheduled["times"] - expected_times)),
-        2e-14,
-    )
-    check("scheduled recharts occur once per interval", schedule_error, 2e-14)
-    check(
-        "stored simulation fluxes satisfy constraints",
-        max(np.max(scheduled["divergence"]), np.max(scheduled["boundary_error"])),
-        2e-12,
-    )
-    check(
-        "stored vorticity changes start at zero",
-        max(
-            abs(scheduled["velocity_vorticity_change"][0]),
-            abs(scheduled["clebsch_vorticity_change"][0]),
-        ),
-        1e-14,
-    )
-
-    # Cross the old full-metric failure time to catch both the energy
-    # explosion and the former fake-output-time freeze.
-    stability_settings = replace(
-        settings,
-        final_time=2.0,
-        frames=81,
-        cfl=0.25,
-        maximum_time_step=0.02,
-        rechart_cutoff=1.5,
-        rechart_every_frames=5,
-        determinant_floor=0.05,
-        initial_condition=PERTURBED,
-        perturbation_amplitude=0.25,
-    )
-    stability_operators = build_operators(stability_settings)
-    stable = simulate(stability_operators, stability_settings)
-    energy_ratio = stable["energy"] / stable["energy"][0]
-    check(
-        "nonlinear feedback stays finite",
-        float(
-            not np.all(np.isfinite(stable["edge_fluxes"]))
-            or np.max(stable["maximum_speed"]) >= 10.0
-        ),
-        0.0,
-    )
-    check(
-        "nonlinear kinetic energy stays bounded",
-        max(0.0, np.max(np.abs(energy_ratio - 1.0)) - 0.5),
-        0.0,
-    )
-    check(
-        "nonlinear run reaches final time by steps",
-        abs(stable["times"][-1] - stability_settings.final_time)
-        + float(stable["number_of_steps"] <= 0),
-        2e-14,
-    )
-    print(
-        "Nonlinear T=2 energy range: "
-        f"[{np.min(energy_ratio):.6f}, {np.max(energy_ratio):.6f}] E0; "
-        f"steps={stable['number_of_steps']}"
-    )
-
-    passed = all(results)
-    print("-" * 82)
-    print(f"Mandatory tests: {sum(results)}/{len(results)} passed")
-    return passed
-
+        print(f"Maximum reset raw-flux residual:{maximum_raw_flux_residual:.6e}")
+        print(f"Maximum reset Clebsch-curl jump:{maximum_curl_jump:.6e}")
 
 def parse_arguments(*, fixed_initial_condition=None, description=None):
     """Parse the shared solver CLI, optionally locking one experiment IC."""
@@ -1884,7 +1808,7 @@ def parse_arguments(*, fixed_initial_condition=None, description=None):
     else:
         parser.set_defaults(perturbation_amplitude=0.0)
     parser.add_argument(
-        "--stabilization", choices=("centered", "graph"),
+        "--stabilization", choices=("skew", "muscl", "centered", "graph"),
         default=defaults.stabilization,
     )
     parser.add_argument("--graph-viscosity", type=float, default=defaults.graph_viscosity)
@@ -1892,21 +1816,10 @@ def parse_arguments(*, fixed_initial_condition=None, description=None):
     parser.add_argument("--random-seed", type=int, default=defaults.random_seed)
     parser.add_argument("--arrow-stride", type=int, default=defaults.arrow_stride)
     parser.add_argument("--playback-fps", type=float, default=defaults.playback_fps)
-    parser.add_argument("--headless", action="store_true", help="run diagnostics without opening Polyscope")
     parser.add_argument(
-        "--diagnostics-plot", metavar="PATH",
-        help=(
-            "save a PNG time-series plot of relative divergence, kinetic-energy "
-            "change, and the two relative vorticity L2 differences"
-        ),
-    )
-    parser.add_argument(
-        "--show-diagnostic-plots", action="store_true",
-        help="show the diagnostic time-series plot in a Matplotlib window",
-    )
-    parser.add_argument(
-        "--run-tests", action="store_true",
-        help="run the shared solver diagnostics for both initial conditions and exit",
+        "--headless",
+        action="store_true",
+        help="run without opening the interactive Polyscope viewer",
     )
     arguments = parser.parse_args()
     if (
@@ -1924,36 +1837,17 @@ def parse_arguments(*, fixed_initial_condition=None, description=None):
         )
     values = vars(arguments)
     headless = values.pop("headless")
-    diagnostics_plot = values.pop("diagnostics_plot")
-    show_diagnostic_plots = values.pop("show_diagnostic_plots")
-    run_tests = values.pop("run_tests")
-    return (
-        Settings(**values), headless, run_tests,
-        diagnostics_plot, show_diagnostic_plots,
-    )
+    return Settings(**values), headless
 
 
 def main(*, fixed_initial_condition=None, description=None):
-    (
-        settings, headless, run_tests,
-        diagnostics_plot, show_diagnostic_plots,
-    ) = parse_arguments(
+    settings, headless = parse_arguments(
         fixed_initial_condition=fixed_initial_condition,
         description=description,
     )
-    if run_tests:
-        if not run_diagnostic_tests():
-            raise SystemExit(1)
-        return
     operators = build_operators(settings)
     result = simulate(operators, settings)
     print_report(result, operators, settings)
-    if diagnostics_plot is not None or show_diagnostic_plots:
-        plot_diagnostic_histories(
-            result, settings,
-            output_path=diagnostics_plot,
-            show=show_diagnostic_plots,
-        )
     if not headless:
         visualize(result, operators, settings)
 
